@@ -8,12 +8,14 @@ import {
   stochRsiSeries,
   vwapSeries,
 } from "./indicators";
-import { computeFifthDimension } from "./dimension";
+import { COIN_FLIP_Z, DEFAULT_PAYOUT, ROUND_SECONDS, coreFromParts, evOf, noiseFloorOf, normCdf, payoutsOf, sigma1mOf, sigmaRemainingOf } from "./core";
+import { activeTimeAdjustment } from "./timeStructure";
+import type { TimeStructureModel } from "./timeStructure";
 import { BASE_WEIGHTS } from "./learning";
 import type { CategoryWeights } from "./learning";
 import { consecutiveRun, detectPatterns } from "./patterns";
 import { detectSmc } from "./smc";
-import type { Analysis, Candle, CategoryScores, Direction, PoolInfo, Recommendation, Signal } from "./types";
+import type { Analysis, Candle, CategoryScores, Direction, FifthDimension, PoolInfo, Recommendation, Signal } from "./types";
 
 export interface SeriesBundle {
   ema9: number[];
@@ -74,10 +76,14 @@ export interface AnalyzeOptions {
   /** Adaptive category weights from the learning engine (defaults to baseline). */
   weights?: CategoryWeights;
   /**
-   * Regime noise discount from the BTC Mind engine (0..1). Pulls the
-   * indicator probability toward 50% when the tape is unpredictable.
+   * Regime noise discount from the BTC Mind engine (0..1). Scales how much the
+   * drift and structure terms are allowed to speak.
    */
   probShrink?: number;
+  /** Validated time-structure model — unvalidated buckets contribute zero. */
+  timeModel?: TimeStructureModel | null;
+  /** Start epoch of the round being analyzed (selects the time bucket). */
+  roundStart?: number | null;
 }
 
 /**
@@ -366,40 +372,113 @@ export function analyzeAt(candles: Candle[], b: SeriesBundle, i: number, opts: A
     w.volume * volScore +
     w.structure * structureScore +
     w.confluence * confluenceScore;
-  const probShrink = clamp(opts.probShrink ?? 1, 0.1, 1);
-  const indicatorUpProb = clamp(50 + totalScore * 0.45 * probShrink, 5, 95);
-
-  // ---------- Fifth Dimension: gap physics, time decay, noise floor, payout EV ----------
-  const secondsLeft = opts.secondsLeft ?? null;
-  const { fifth, blendedUpProb } = computeFifthDimension({
-    candles,
-    index: i,
-    price,
-    lockPrice: opts.lockPrice,
-    secondsLeft,
-    atr,
-    indicatorUpProb,
-    pool: opts.pool ?? null,
-  });
-  const upProbability = Math.round(clamp(blendedUpProb, 3, 97));
+  // ---------- Minimal core: P(UP) = Φ(gap + drift + time + structure) ----------
+  // One term per information source, all in σ units, nothing counted twice:
+  //   zGap   distance from lock ÷ remaining volatility (the physics term)
+  //   zDrift ONE drift value compressed from trend+momentum+volume (learned
+  //          weights); confluence is EXCLUDED — it is derived from these same
+  //          categories and would double count
+  //   zTime  learned time-structure adjustment, zero unless validated
+  //   zStruct small hard-capped structure term
+  const shrink = clamp(opts.probShrink ?? 1, 0.15, 1);
+  const secondsLeft = opts.secondsLeft ?? ROUND_SECONDS;
+  const sigma1m = sigma1mOf(candles, i, atr, price);
+  const sigmaRemaining = sigmaRemainingOf(sigma1m, secondsLeft);
+  const noiseFloor = noiseFloorOf(sigmaRemaining);
+  const lockPrice = opts.lockPrice ?? null;
+  const hasLock = lockPrice !== null && lockPrice > 0;
+  const gap = hasLock ? price - lockPrice : 0;
+  const zGap = hasLock && sigmaRemaining > 0 ? gap / sigmaRemaining : 0;
+  const driftWeightSum = w.trend + w.momentum + w.volume || 1;
+  const driftScore = (w.trend * trendScore + w.momentum * momScore + w.volume * volScore) / driftWeightSum;
+  const timeAdj = activeTimeAdjustment(opts.timeModel, opts.roundStart ?? null);
+  const core = coreFromParts({ zGap, wtd: driftScore, structScore: structureScore, shrink, zTime: timeAdj });
+  const upProbability = Math.round(core.pUp);
   const downProbability = 100 - upProbability;
+
+  // ---------- Payouts & expected value ----------
+  const pay = payoutsOf(opts.pool ?? null);
+  const payoutUp = pay.payoutUp;
+  const payoutDown = pay.payoutDown;
+  const evUp = evOf(core.pUp, payoutUp ?? DEFAULT_PAYOUT);
+  const evDown = evOf(100 - core.pUp, payoutDown ?? DEFAULT_PAYOUT);
+  const gapProbUp = clamp(normCdf(zGap) * 100, 2, 98);
+  const coinFlip = hasLock && secondsLeft <= 180 && Math.abs(zGap) < COIN_FLIP_Z;
+  const gapShare = core.zTotal !== 0 ? Math.abs(zGap) / Math.abs(core.zTotal) : 0;
+
   const agreement = Math.abs(bulls - bears) / signs.length;
-  let confidence = Math.round(clamp(28 + Math.abs(totalScore) * 0.55 + agreement * 32, 12, 96));
-  if (fifth.coinFlip) {
+  let confidence = Math.round(clamp(30 + Math.abs(core.zTotal) * 30 + agreement * 22, 12, 96));
+  if (coinFlip) {
     // A coin-flip round can never be a confident round.
     confidence = Math.min(confidence, 40);
-  } else if (secondsLeft !== null && secondsLeft <= 120 && Math.abs(fifth.zScore) >= 1.2) {
-    // Late round with the gap well clear of noise — the close model is near-certain.
-    confidence = Math.max(confidence, Math.min(93, Math.round(50 + Math.abs(fifth.zScore) * 18)));
+  } else if (hasLock && secondsLeft <= 120 && Math.abs(zGap) >= 1.2) {
+    // Late in a locked round with the gap well clear of noise — near-certain.
+    confidence = Math.max(confidence, Math.min(93, Math.round(50 + Math.abs(zGap) * 18)));
   }
   const expectedMovePct = (atr / price) * 100 * 2.24;
-  const expectedDirection: "up" | "down" | "flat" = totalScore > 8 ? "up" : totalScore < -8 ? "down" : "flat";
-  // Recommendation gates: never bet a coin flip, never bet a negative-EV side.
+  const expectedDirection: "up" | "down" | "flat" = core.zDrift > 0.08 ? "up" : core.zDrift < -0.08 ? "down" : "flat";
+  // Base recommendation: never a coin flip, never a composite this weak, never
+  // a side below the base EV bar. The live advisor layers the dynamic EV gate,
+  // the regime gate, and the proven-condition ledger on top.
   let recommendation: Recommendation = "WAIT";
-  if (!fifth.coinFlip) {
-    if (upProbability >= 58 && confidence >= 55 && fifth.evUp >= 0.03) recommendation = "UP";
-    else if (upProbability <= 42 && confidence >= 55 && fifth.evDown >= 0.03) recommendation = "DOWN";
+  if (!coinFlip && Math.abs(core.zTotal) >= 0.35) {
+    if (core.pUp >= 53 && evUp >= 0.02) recommendation = "UP";
+    else if (core.pUp <= 47 && evDown >= 0.02) recommendation = "DOWN";
   }
+
+  const fifthSignals: Signal[] = [];
+  if (hasLock) {
+    const insideNoise = Math.abs(gap) < noiseFloor;
+    fifthSignals.push({
+      label: insideNoise ? "Gap buried inside noise floor" : `Gap ${Math.abs(zGap).toFixed(1)}σ ${gap >= 0 ? "above" : "below"} lock`,
+      direction: insideNoise ? "neutral" : gap >= 0 ? "bull" : "bear",
+      detail: `${gap >= 0 ? "+" : "−"}$${Math.abs(gap).toFixed(2)} vs ±$${noiseFloor.toFixed(2)}`,
+    });
+    fifthSignals.push({
+      label: "Physics close model",
+      direction: gapProbUp >= 55 ? "bull" : gapProbUp <= 45 ? "bear" : "neutral",
+      detail: `${gapProbUp.toFixed(0)}% UP`,
+    });
+  }
+  if (pay.crowd === "down-heavy" && payoutDown !== null) {
+    fifthSignals.push({ label: "Crowd stacked on DOWN — thin payout", direction: "neutral", detail: `${payoutDown.toFixed(2)}x` });
+  } else if (pay.crowd === "up-heavy" && payoutUp !== null) {
+    fifthSignals.push({ label: "Crowd stacked on UP — thin payout", direction: "neutral", detail: `${payoutUp.toFixed(2)}x` });
+  }
+  if (coinFlip) {
+    fifthSignals.push({ label: "Coin-flip zone — stand down", direction: "neutral", detail: `${Math.round(secondsLeft)}s left` });
+  }
+
+  let verdict: string;
+  if (coinFlip) {
+    verdict = "Outcome is inside random noise — any bet here is a coin flip. Stand down.";
+  } else if (evUp <= 0 && evDown <= 0) {
+    verdict = pay.estimated
+      ? "Neither side clears the payout breakeven — no statistical edge."
+      : "Crowd-skewed payouts: both sides carry negative expected value.";
+  } else {
+    const evSide = evUp >= evDown ? "UP" : "DOWN";
+    const bestEv = Math.max(evUp, evDown);
+    verdict = `${evSide} is the +EV side: ${(bestEv * 100).toFixed(1)}% expected value per bet${pay.estimated ? " (est. payout)" : ""}.`;
+  }
+
+  const fifth: FifthDimension = {
+    gap,
+    sigmaRemaining,
+    noiseFloor,
+    zScore: zGap,
+    gapProbUp,
+    blendWeight: gapShare,
+    coinFlip,
+    payoutUp,
+    payoutDown,
+    evUp,
+    evDown,
+    evEstimated: pay.estimated,
+    crowd: pay.crowd,
+    signals: fifthSignals,
+    verdict,
+  };
 
   const rsiReversal: Direction =
     prevRsi < 30 && rsi >= 30 ? "bull" : prevRsi > 70 && rsi <= 70 ? "bear" : "neutral";
@@ -475,6 +554,7 @@ export function analyzeAt(candles: Candle[], b: SeriesBundle, i: number, opts: A
     recommendation,
     narrative,
     fifth,
+    core,
   };
 }
 

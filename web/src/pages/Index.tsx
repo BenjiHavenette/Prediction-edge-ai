@@ -1,4 +1,4 @@
-import { AlarmClock, CandlestickChart, History, LayoutDashboard, RotateCcw, Wifi, WifiOff, Zap } from "lucide-react";
+import { AlarmClock, CandlestickChart, FlaskConical, Gauge, History, LayoutDashboard, RotateCcw, Wifi, WifiOff, Zap } from "lucide-react";
 import { useState } from "react";
 import type { LucideIcon } from "lucide-react";
 
@@ -16,6 +16,8 @@ import {
   VolumePanel,
   VwapPanel,
 } from "@/components/EnginePanels";
+import BacktestTab from "@/components/BacktestTab";
+import CalibrationTab from "@/components/CalibrationTab";
 import HeroPanel from "@/components/HeroPanel";
 import HistoryTab from "@/components/HistoryTab";
 import LearningPanel from "@/components/LearningPanel";
@@ -31,10 +33,12 @@ import { COIN_IDS } from "@/lib/coins";
 import { fmtUsd } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
-type Tab = "live" | "regime" | "history" | "candles" | "replay";
+type Tab = "live" | "accuracy" | "backtest" | "regime" | "history" | "candles" | "replay";
 
 const TABS: { id: Tab; label: string; short: string; icon: LucideIcon }[] = [
   { id: "live", label: "Live", short: "Live", icon: LayoutDashboard },
+  { id: "accuracy", label: "Accuracy", short: "Accuracy", icon: Gauge },
+  { id: "backtest", label: "Walk-Forward", short: "Backtest", icon: FlaskConical },
   { id: "regime", label: "Regime Clock", short: "Regime", icon: AlarmClock },
   { id: "history", label: "Edge Analyzer", short: "Edge", icon: History },
   { id: "candles", label: "3-Candle Analyzer", short: "3-Candle", icon: CandlestickChart },
@@ -195,6 +199,8 @@ const Index = () => {
 
       <main className="mx-auto max-w-7xl px-3 pb-14 pt-3 sm:px-4">
         {tab === "live" && <LiveTab />}
+        {tab === "accuracy" && <CalibrationTab />}
+        {tab === "backtest" && <BacktestTab />}
         {tab === "regime" && <RegimeClockTab />}
         {tab === "history" && <HistoryTab />}
         {tab === "candles" && <TripleCandleTab />}

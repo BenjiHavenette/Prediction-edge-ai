@@ -30,10 +30,14 @@ function snapshotFrom(a: Analysis): RoundSnapshot {
     categories: a.categories,
     narrative: a.narrative,
     expectedMovePct: a.expectedMovePct,
-    gapZ: a.fifth.zScore,
+    gapZ: a.core.zGap,
     coinFlip: a.fifth.coinFlip,
     evUp: a.fifth.evUp,
     evDown: a.fifth.evDown,
+    // Pre-time z composite: lets the walk-forward backtest and the time-structure
+    // engine reconstruct predictions without double-applying the time adjustment.
+    zBase: Math.round((a.core.zTotal - a.core.zTime) * 1000) / 1000,
+    shrink: Math.round(a.core.shrink * 1000) / 1000,
   };
 }
 
@@ -76,7 +80,7 @@ export function buildRecord(
     regimeKind: regime?.kind,
     regimeLabel: regime?.label,
     live,
-    snapshot: snapshotFrom(a),
+    snapshot: { ...snapshotFrom(a), regimeAlignment: regime?.alignment },
   };
 }
 

@@ -1,4 +1,4 @@
-import { ArrowDownRight, ArrowUpRight, Brain, Clock3, Crosshair, Gavel, Hourglass, Layers, ShieldAlert, Snowflake, Sparkles } from "lucide-react";
+import { ArrowDownRight, ArrowUpRight, BadgeCheck, Brain, Clock3, Crosshair, Gavel, Hourglass, Layers, Scale, ShieldAlert, Snowflake } from "lucide-react";
 
 import { StatRow } from "@/components/bits";
 import { useMarket } from "@/hooks/useMarket";
@@ -23,7 +23,6 @@ export default function NextRoundPanel() {
       : n.regime.kind === "trend-down"
         ? "border-down/40 bg-down/10 text-down"
         : "border-warn/40 bg-warn/10 text-warn";
-  const discount = Math.round((1 - n.regime.shrink) * 100);
   const htfTone =
     n.regime.alignment === "aligned"
       ? "border-up/40 bg-up/10 text-up"
@@ -131,17 +130,27 @@ export default function NextRoundPanel() {
             <span className="text-muted-foreground">predictability {n.regime.predictability}%</span>
             <span className="text-muted-foreground">·</span>
             <span className="text-muted-foreground">
-              raw {n.rawUpProb}% → {n.upProb}% after {discount}% noise discount
+              core {n.rawUpProb}% → {n.upProb}% with time structure
             </span>
-            {n.neuroDelta !== 0 && (
-              <span
-                className={cn(
-                  "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-bold uppercase tracking-wide",
-                  n.neuroDelta > 0 ? "border-up/40 bg-up/10 text-up" : "border-down/40 bg-down/10 text-down",
-                )}
-              >
-                <Sparkles className="h-3 w-3" />
-                neuro {n.neuroDelta > 0 ? "+" : ""}{n.neuroDelta}pt
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-bold uppercase tracking-wide",
+                Math.max(n.evUp, n.evDown) >= n.evGate ? "border-up/40 bg-up/10 text-up" : "border-warn/40 bg-warn/10 text-warn",
+              )}
+            >
+              <Scale className="h-3 w-3" />
+              EV gate {(Math.max(n.evUp, n.evDown) * 100).toFixed(1)}% / {(n.evGate * 100).toFixed(1)}%
+            </span>
+            {n.condition !== null && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-up/40 bg-up/10 px-2 py-0.5 font-bold uppercase tracking-wide text-up">
+                <BadgeCheck className="h-3 w-3" />
+                {n.condition}
+              </span>
+            )}
+            {n.conditionsKnown && n.condition === null && n.side === null && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 font-bold uppercase tracking-wide text-warn">
+                <ShieldAlert className="h-3 w-3" />
+                no proven condition
               </span>
             )}
             {n.playbook.veto !== null && (
@@ -162,6 +171,22 @@ export default function NextRoundPanel() {
                 model cold {Math.round(n.coldHitRate * 100)}% / {n.coldSample}
               </span>
             )}
+          </div>
+          <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+            {([
+              ["Gap term", n.core.zGap],
+              ["Drift term", n.core.zDrift],
+              ["Time term", n.core.zTime],
+              ["Structure", n.core.zStruct],
+            ] as const).map(([label, v]) => (
+              <div key={label} className="rounded-lg bg-secondary/50 px-2.5 py-1.5">
+                <div className="text-[9px] uppercase tracking-widest text-muted-foreground">{label}</div>
+                <div className={cn("font-mono text-sm font-bold tnum", v > 0.001 ? "text-up" : v < -0.001 ? "text-down" : "text-muted-foreground")}>
+                  {v >= 0 ? "+" : ""}
+                  {v.toFixed(2)}σ
+                </div>
+              </div>
+            ))}
           </div>
           <div className="grid grid-cols-2 gap-x-4">
             <StatRow
@@ -197,8 +222,9 @@ export default function NextRoundPanel() {
           </div>
           <p className="text-xs leading-relaxed text-foreground/85">{n.reason}</p>
           <p className="font-mono text-[9px] uppercase leading-relaxed tracking-wide text-muted-foreground">
-            Entries only fire WITH a trending tape that the 15-minute frame confirms — the one condition that audits
-            above 60% accuracy. Chop, storm, and counter-15m setups are blocked, no matter what the indicators say.
+            P(UP) = Φ(gap ÷ remaining noise + one compressed drift + validated time structure + small structure term).
+            The gate is expected value, recalculated on every price tick and settled round. Once conditions prove
+            forward out-of-sample, only they authorize entries — everything else is a wait.
           </p>
         </div>
       </div>

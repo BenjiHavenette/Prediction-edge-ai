@@ -36,6 +36,27 @@ export interface CategoryScores {
   confluence: number;
 }
 
+/**
+ * Minimal core decomposition — every term in standard-deviation (z) units, so
+ * P(UP) = Φ(zGap + zDrift + zTime + zStruct) and nothing is counted twice.
+ */
+export interface CoreOutput {
+  /** Distance from lock divided by remaining volatility. */
+  zGap: number;
+  /** ONE drift value compressed from all indicators (trend+momentum+volume). */
+  zDrift: number;
+  /** Small hard-capped market-structure term. */
+  zStruct: number;
+  /** Learned, validation-gated time-structure adjustment. */
+  zTime: number;
+  /** Sum of all four terms. */
+  zTotal: number;
+  /** Regime trust factor that was applied to drift/structure (0..1). */
+  shrink: number;
+ /** Final UP probability (0..100). */
+  pUp: number;
+}
+
 export type Recommendation = "UP" | "DOWN" | "WAIT";
 
 /** Live PancakeSwap prize pool amounts for the round being predicted (BNB). */
@@ -57,11 +78,11 @@ export interface FifthDimension {
   sigmaRemaining: number;
   /** Gap below this is statistically meaningless noise, $. */
   noiseFloor: number;
-  /** Gap expressed in remaining-volatility standard deviations. */
+  /** Gap expressed in remaining-volatility standard deviations (the zGap term). */
   zScore: number;
   /** Probability of closing above lock from the gap/noise model alone (0..100). */
   gapProbUp: number;
-  /** Weight of the gap model in the final blended probability (0..1), grows as time runs out. */
+  /** Share of the total core signal contributed by the gap term (0..1). */
   blendWeight: number;
   /** True when the round outcome is inside random noise — no side has an edge. */
   coinFlip: boolean;
@@ -144,6 +165,8 @@ export interface Analysis {
   recommendation: Recommendation;
   narrative: string;
   fifth: FifthDimension;
+  /** Minimal core decomposition behind upProbability. */
+  core: CoreOutput;
 }
 
 /** Compact indicator snapshot stored per round for backtesting and replay. */
@@ -170,6 +193,10 @@ export interface RoundSnapshot {
   coinFlip?: boolean;
   evUp?: number;
   evDown?: number;
+  /** Core fields: pre-time z composite and regime trust factor at lock (absent on old records). */
+  zBase?: number;
+  shrink?: number;
+  regimeAlignment?: "aligned" | "unconfirmed" | "conflict";
 }
 
 export interface RoundRecord {

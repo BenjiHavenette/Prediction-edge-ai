@@ -12,8 +12,15 @@ import type { ImportAudit, ImportOutcome } from "@/lib/importCsv";
 import { pearson, returnsOf } from "@/lib/indicators";
 import { computeLearning } from "@/lib/learning";
 import type { LearningState } from "@/lib/learning";
-import { computeNeuro, featuresFromAnalysis, neuroDelta } from "@/lib/neuro";
+import { computeNeuro } from "@/lib/neuro";
 import type { NeuroState } from "@/lib/neuro";
+import { computeCalibration } from "@/lib/calibration";
+import type { CalibrationReport } from "@/lib/calibration";
+import { evThreshold, normCdf } from "@/lib/core";
+import { matchLiveCondition, searchConditions } from "@/lib/conditionSearch";
+import type { ConditionProof } from "@/lib/conditionSearch";
+import { bucketOf, fitTimeModel } from "@/lib/timeStructure";
+import type { TimeStructureModel } from "@/lib/timeStructure";
 import { fetchLiveChainRound } from "@/lib/pancake";
 import type { ChainRound } from "@/lib/pancake";
 import { loadPositions, savePositions } from "@/lib/positions";
@@ -70,16 +77,22 @@ export interface NextRoundState {
   entryWindow: boolean;
   action: "ENTER UP" | "ENTER DOWN" | "WAIT" | "STAND DOWN";
   reason: string;
-  /** Indicator probability before the regime noise discount (0..100). */
-  rawUpProb: number;
   /** Live BTC behavioral regime driving the noise discount and entry gates. */
   regime: RegimeState;
   /** True when recent live calls have been losing — entry bars raised. */
   cold: boolean;
   coldHitRate: number;
   coldSample: number;
-  /** Probability points added/removed by the neuroplasticity layer. */
-  neuroDelta: number;
+  /** Probability the next round closes UP before the time-structure adjustment (0..100). */
+  rawUpProb: number;
+  /** Minimal core decomposition of the current forecast (all terms in σ units). */
+  core: Analysis["core"];
+  /** Dynamic EV threshold currently enforced per 1 staked. */
+  evGate: number;
+  /** Label of the proven condition authorizing this side (null when none matched). */
+  condition: string | null;
+  /** True once at least one condition has proven forward on out-of-sample history. */
+  conditionsKnown: boolean;
   /** Wall Street Playbook evaluation for this round. */
   playbook: PlaybookResult;
 }
@@ -101,8 +114,14 @@ interface MarketContextValue {
   correlation: CorrelationState;
   nextRound: NextRoundState | null;
   learning: LearningState;
-  /** Neuroplasticity brain state — synaptic trust per signal. */
+  /** Neuroplasticity brain state — synaptic trust per signal (display/telemetry). */
   neuro: NeuroState;
+  /** Time-structure model — refit on every settled round, applied only when validated. */
+  timeModel: TimeStructureModel;
+  /** Calibration by probability bucket — recomputed on every settled round. */
+  calibration: CalibrationReport | null;
+  /** Condition ledger — discovered conditions with prove-forward status. */
+  conditions: ConditionProof[];
   regimeForecast: RegimeForecast | null;
   /** Historical accuracy audit per regime × 15m-frame condition. */
   regimeAudit: RegimeAudit | null;
@@ -141,6 +160,9 @@ export function MarketProvider({ children }: { children: ReactNode }) {
   const [nextRound, setNextRound] = useState<NextRoundState | null>(null);
   const [learning, setLearning] = useState<LearningState>(() => computeLearning([]));
   const [neuro, setNeuro] = useState<NeuroState>(() => computeNeuro([]));
+  const [timeModel, setTimeModel] = useState<TimeStructureModel>(() => fitTimeModel([]));
+  const [calibration, setCalibration] = useState<CalibrationReport | null>(null);
+  const [conditions, setConditions] = useState<ConditionProof[]>([]);
   const [regimeForecast, setRegimeForecast] = useState<RegimeForecast | null>(null);
   const [regimeAudit, setRegimeAudit] = useState<RegimeAudit | null>(null);
   const [positions, setPositions] = useState<UserPosition[]>(() => loadPositions(COINS[loadSelectedCoin()].storageSuffix));
@@ -158,6 +180,9 @@ export function MarketProvider({ children }: { children: ReactNode }) {
   const lockRegimeRef = useRef<RegimeState | null>(null);
   const learningRef = useRef<LearningState>(computeLearning([]));
   const neuroRef = useRef<NeuroState>(computeNeuro([]));
+  const timeModelRef = useRef<TimeStructureModel>(fitTimeModel([]));
+  const calibrationRef = useRef<CalibrationReport | null>(null);
+  const conditionsRef = useRef<ConditionProof[]>([]);
   const entrySideRef = useRef<{ side: "UP" | "DOWN" | null; since: number }>({ side: null, since: 0 });
   const prevAnalysisRef = useRef<Analysis | null>(null);
   const recordsRef = useRef<RoundRecord[]>([]);
@@ -347,6 +372,10 @@ export function MarketProvider({ children }: { children: ReactNode }) {
       pool,
       weights,
       probShrink: regime.shrink,
+      timeModel: timeModelRef.current,
+      // rs — at the boundary tick this snapshot becomes the NEW round's lock
+      // analysis, so it must carry the new round's time bucket.
+      roundStart: rs,
     });
 
     // ---- Next-round entry forecast: the round you can actually bet on. ----
@@ -366,12 +395,13 @@ export function MarketProvider({ children }: { children: ReactNode }) {
       pool: nextPool,
       weights,
       probShrink: regime.shrink,
+      timeModel: timeModelRef.current,
+      roundStart: closeTime,
     });
-    // Neuroplasticity layer: synapses the brain trusts push the forecast,
-    // signals it has learned to distrust are discounted.
-    const nDelta = neuroDelta(neuroRef.current, featuresFromAnalysis(nextA));
-    const nUp = Math.round(Math.min(95, Math.max(5, nextA.upProbability + nDelta)));
-    const rawUp = Math.round(Math.min(95, Math.max(5, 50 + nextA.totalScore * 0.45)));
+    // The core probability IS the forecast — no post-hoc layer may bend it,
+    // otherwise the calibration dashboard would be measuring a fiction.
+    const nUp = nextA.upProbability;
+    const rawUp = Math.round(Math.min(95, Math.max(5, normCdf(nextA.core.zTotal - nextA.core.zTime) * 100)));
     const nEvUp = nextA.fifth.evUp;
     const nEvDown = nextA.fifth.evDown;
 
@@ -395,25 +425,49 @@ export function MarketProvider({ children }: { children: ReactNode }) {
       lossStreak++;
     }
 
-    // Accuracy-first gates: the audit showed only 15m-confirmed trends clear 60%,
-    // so the probability bar starts at 60 and rises when confirmation is partial,
-    // when the model is cold, or when the audited hit rate is below target.
+    // EV IS the decision gate: a small dynamic threshold (base 1.5%) rises while
+    // the model is cold, the graded sample is thin, calibration drifts, or the
+    // regime audit is below target. The expected value of the actual payout must
+    // clear the bar — no probability-bar games.
     const audit = auditRef.current;
     const auditPenalty = audit !== null && audit.bettableRounds >= 10 && !audit.clearsTarget ? 2 : 0;
-    const alignPenalty = regime.alignment === "aligned" ? 0 : 3;
-    const probGate = (cold ? 64 : 60) + auditPenalty + alignPenalty;
-    const confGate = (cold ? 64 : 58) + auditPenalty;
-    const evGate = cold ? 0.08 : 0.05;
+    const evGate = Math.min(
+      0.06,
+      evThreshold({ cold, decidedSample: coldSample, meanGapPct: calibrationRef.current?.meanGap ?? null }) + auditPenalty / 100,
+    );
     const trending = regime.kind === "trend-up" || regime.kind === "trend-down";
     const htfOk = regime.alignment !== "conflict";
     // Only ever bet WITH the tape AND the 15-minute frame: a micro trend fighting
     // the 15m structure is a pullback in disguise and is never bet.
-    const side: "UP" | "DOWN" | null =
-      regime.kind === "trend-up" && htfOk && nUp >= probGate && nextA.confidence >= confGate && nEvUp >= evGate
-        ? "UP"
-        : regime.kind === "trend-down" && htfOk && nUp <= 100 - probGate && nextA.confidence >= confGate && nEvDown >= evGate
-          ? "DOWN"
-          : null;
+    let side: "UP" | "DOWN" | null = null;
+    if (trending && htfOk && !nextA.fifth.coinFlip) {
+      if (regime.kind === "trend-up" && nUp >= 53 && nEvUp >= evGate) side = "UP";
+      else if (regime.kind === "trend-down" && nUp <= 47 && nEvDown >= evGate) side = "DOWN";
+    }
+    // Proven-condition ledger: once history has proven conditions forward, a live
+    // setup must match one — that is how the app learns when it should wait.
+    const conds = conditionsRef.current;
+    const conditionsKnown = conds.some((c) => c.status === "proven");
+    let condition: string | null = null;
+    let conditionBlocked = false;
+    if (side !== null && conditionsKnown) {
+      const match = matchLiveCondition(conds, {
+        regimeKind: regime.kind,
+        alignment: regime.alignment ?? undefined,
+        zGap: nextA.core.zGap,
+        zDrift: nextA.core.zDrift,
+        zStruct: nextA.core.zStruct,
+        zTime: nextA.core.zTime,
+        pUp: nUp,
+        ...bucketOf(closeTime),
+      });
+      if (match) {
+        condition = match.proof.label;
+      } else {
+        side = null;
+        conditionBlocked = true;
+      }
+    }
     // Wall Street Playbook: the legends get the final word on every entry.
     const playbook = evaluatePlaybook({
       regimeKind: regime.kind,
@@ -447,9 +501,13 @@ export function MarketProvider({ children }: { children: ReactNode }) {
     } else if (!htfOk) {
       action = "STAND DOWN";
       reason = `${regime.label} on the micro tape, but the 15-minute frame points the other way (${regime.htf.label}). Counter-15m entries graded ${audit !== null && audit.buckets[2].rounds > 0 ? `${audit.buckets[2].hitRatePct.toFixed(0)}% over ${audit.buckets[2].rounds} audited rounds` : "below target historically"} — this setup is blocked.${coldNote}`;
-    } else if (side === null) {
+    } else if (conditionBlocked) {
       action = "STAND DOWN";
-      reason = `${regime.label}, but after the noise discount the edge is only ${nUp >= 50 ? nUp : 100 - nUp}% (raw ${rawUp >= 50 ? rawUp : 100 - rawUp}%) — below the ${probGate}% accuracy bar${regime.alignment !== "aligned" ? " (raised while the 15m frame is unconfirmed)" : ""} or the EV/confidence gates. No bet without a 60%+ edge.${coldNote}`;
+      reason = `${regime.label} clears the EV gate, but this setup matches no proven condition. The engine only bets patterns that held up on untouched out-of-sample history — waiting IS the position.${coldNote}`;
+    } else if (side === null) {
+      const bestEv = Math.max(nEvUp, nEvDown);
+      const fmt = (v: number): string => `${v >= 0 ? "+" : ""}${v.toFixed(2)}`;
+      reason = `${regime.label}: core reads ${nUp >= 50 ? nUp : 100 - nUp}% ${nUp >= 50 ? "UP" : "DOWN"} (gap ${fmt(nextA.core.zGap)}σ · drift ${fmt(nextA.core.zDrift)} · time ${fmt(nextA.core.zTime)} · structure ${fmt(nextA.core.zStruct)}), best EV ${(bestEv * 100).toFixed(1)}% vs the ${(evGate * 100).toFixed(1)}% gate — below the bar, or the tape isn't a confirmed trend.${coldNote}`;
     } else if (playbook.veto !== null) {
       action = "STAND DOWN";
       reason = `${playbook.veto.legend}'s rule (${playbook.veto.trade}) blocks this entry. ${playbook.veto.note}`;
@@ -464,8 +522,9 @@ export function MarketProvider({ children }: { children: ReactNode }) {
       reason = `${side} signal is only ${stableFor}s old — wait for it to hold at least 25s before committing.`;
     } else {
       action = side === "UP" ? "ENTER UP" : "ENTER DOWN";
-      const htfNote = regime.alignment === "aligned" ? " and the 15-minute frame confirms" : " (15m frame flat — gates were raised and still cleared)";
-      reason = `${side} rides the ${regime.kind === "trend-up" ? "up" : "down"}trend regime${htfNote}: held ${stableFor}s at ${nUp >= 50 ? nUp : 100 - nUp}% (after noise discount) with positive EV — the only condition that audits above 60% accuracy.`;
+      const htfNote = regime.alignment === "aligned" ? " and the 15-minute frame confirms" : " (15m frame flat — EV gate was raised and still cleared)";
+      const ev = side === "UP" ? nEvUp : nEvDown;
+      reason = `${side} rides the ${regime.kind === "trend-up" ? "up" : "down"}trend regime${htfNote}: core ${nUp >= 50 ? nUp : 100 - nUp}% with ${(ev * 100).toFixed(1)}% EV against the ${(evGate * 100).toFixed(1)}% gate${condition ? ` — proven condition: ${condition}` : ""}.`;
       if (playbook.conviction) {
         const conv = playbook.fired.find((f) => f.stance === "conviction");
         if (conv) reason += ` CONVICTION: ${conv.note}`;
@@ -490,7 +549,10 @@ export function MarketProvider({ children }: { children: ReactNode }) {
       cold,
       coldHitRate,
       coldSample,
-      neuroDelta: nDelta,
+      core: nextA.core,
+      evGate,
+      condition,
+      conditionsKnown,
       playbook,
     };
     nextRoundRef.current = nextState;
@@ -622,10 +684,23 @@ export function MarketProvider({ children }: { children: ReactNode }) {
     const state = computeLearning(records);
     learningRef.current = state;
     setLearning(state);
-    // Neuroplasticity: every settled round re-fires Hebbian learning.
+    // Neuroplasticity stays a telemetry layer — the core probability is the
+    // single source of truth, so nothing double counts.
     const brain = computeNeuro(records);
     neuroRef.current = brain;
     setNeuro(brain);
+    // Continuous recalculation: every settled round refits the time structure,
+    // the calibration report and the condition ledger. No timers, no fixed
+    // four-hour retrain windows — the model moves when the market does.
+    const tm = fitTimeModel(records);
+    timeModelRef.current = tm;
+    setTimeModel(tm);
+    const cal = computeCalibration(records);
+    calibrationRef.current = cal;
+    setCalibration(cal);
+    const conds = searchConditions(records);
+    conditionsRef.current = conds;
+    setConditions(conds);
   }, [records]);
 
   // Poll the PancakeSwap prediction contract so rounds mirror the real on-chain schedule.
@@ -690,6 +765,12 @@ export function MarketProvider({ children }: { children: ReactNode }) {
       setAlerts([]);
       setRegimeForecast(null);
       setRegimeAudit(null);
+      timeModelRef.current = fitTimeModel([]);
+      calibrationRef.current = null;
+      conditionsRef.current = [];
+      setTimeModel(fitTimeModel([]));
+      setCalibration(null);
+      setConditions([]);
       setCorrelation({ pairs: [] });
       const storedPositions = loadPositions(cfg.storageSuffix);
       positionsRef.current = storedPositions;
@@ -911,8 +992,8 @@ export function MarketProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo<MarketContextValue>(
-    () => ({ status, connected, coin: COINS[coinId], setCoin, candles, livePrice, analysis, round, secondsLeft, records, alerts, correlation, nextRound, learning, neuro, regimeForecast, regimeAudit, importAudit, importCsvData, positions, logPosition, cancelPosition, retry }),
-    [status, connected, coinId, setCoin, candles, livePrice, analysis, round, secondsLeft, records, alerts, correlation, nextRound, learning, neuro, regimeForecast, regimeAudit, importAudit, importCsvData, positions, logPosition, cancelPosition, retry],
+    () => ({ status, connected, coin: COINS[coinId], setCoin, candles, livePrice, analysis, round, secondsLeft, records, alerts, correlation, nextRound, learning, neuro, timeModel, calibration, conditions, regimeForecast, regimeAudit, importAudit, importCsvData, positions, logPosition, cancelPosition, retry }),
+    [status, connected, coinId, setCoin, candles, livePrice, analysis, round, secondsLeft, records, alerts, correlation, nextRound, learning, neuro, timeModel, calibration, conditions, regimeForecast, regimeAudit, importAudit, importCsvData, positions, logPosition, cancelPosition, retry],
   );
 
   return <MarketContext.Provider value={value}>{children}</MarketContext.Provider>;

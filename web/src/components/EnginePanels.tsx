@@ -305,7 +305,7 @@ export function FifthDimensionPanel() {
           valueClass={insideNoise ? "text-warn" : undefined}
         />
         <StatRow label="Remaining Volatility (1σ)" value={`±$${f.sigmaRemaining.toFixed(2)}`} />
-        <StatRow label="Gap Model Weight" value={`${Math.round(f.blendWeight * 100)}%`} />
+        <StatRow label="Gap share of signal" value={`${Math.round(f.blendWeight * 100)}%`} />
       </div>
       <div className="mt-2 grid grid-cols-2 gap-3 border-t border-border/60 pt-3">
         <div>
