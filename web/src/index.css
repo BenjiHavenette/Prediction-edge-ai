@@ -1,0 +1,147 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Prediction Edge AI — dark trading terminal design system. All colors HSL. */
+
+@layer base {
+  :root {
+    --background: 222 30% 5%;
+    --foreground: 214 32% 92%;
+
+    --card: 221 26% 8%;
+    --card-foreground: 214 32% 92%;
+
+    --popover: 221 28% 7%;
+    --popover-foreground: 214 32% 92%;
+
+    --primary: 187 92% 52%;
+    --primary-foreground: 222 30% 6%;
+
+    --secondary: 220 20% 13%;
+    --secondary-foreground: 214 32% 92%;
+
+    --muted: 220 18% 12%;
+    --muted-foreground: 217 13% 58%;
+
+    --accent: 220 20% 15%;
+    --accent-foreground: 214 32% 92%;
+
+    --destructive: 350 90% 58%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 219 22% 14%;
+    --input: 219 22% 16%;
+    --ring: 187 92% 52%;
+
+    --radius: 0.75rem;
+
+    /* Market direction palette */
+    --up: 152 84% 46%;
+    --down: 350 92% 60%;
+    --warn: 42 100% 55%;
+
+    --sidebar-background: 221 26% 7%;
+    --sidebar-foreground: 214 32% 92%;
+    --sidebar-primary: 187 92% 52%;
+    --sidebar-primary-foreground: 222 30% 6%;
+    --sidebar-accent: 220 20% 13%;
+    --sidebar-accent-foreground: 214 32% 92%;
+    --sidebar-border: 219 22% 14%;
+    --sidebar-ring: 187 92% 52%;
+  }
+
+  .dark {
+    --background: 222 30% 5%;
+    --foreground: 214 32% 92%;
+    --card: 221 26% 8%;
+    --card-foreground: 214 32% 92%;
+    --popover: 221 28% 7%;
+    --popover-foreground: 214 32% 92%;
+    --primary: 187 92% 52%;
+    --primary-foreground: 222 30% 6%;
+    --secondary: 220 20% 13%;
+    --secondary-foreground: 214 32% 92%;
+    --muted: 220 18% 12%;
+    --muted-foreground: 217 13% 58%;
+    --accent: 220 20% 15%;
+    --accent-foreground: 214 32% 92%;
+    --destructive: 350 90% 58%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 219 22% 14%;
+    --input: 219 22% 16%;
+    --ring: 187 92% 52%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    background:
+      radial-gradient(1100px 700px at 85% -10%, hsl(187 92% 52% / 0.07), transparent 60%),
+      radial-gradient(900px 600px at -10% 110%, hsl(152 84% 46% / 0.05), transparent 60%),
+      hsl(var(--background));
+    background-attachment: fixed;
+  }
+}
+
+@layer utilities {
+  .font-display {
+    font-family: "Chakra Petch", ui-sans-serif, sans-serif;
+  }
+
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .glow-up {
+    text-shadow: 0 0 28px hsl(var(--up) / 0.55);
+  }
+
+  .glow-down {
+    text-shadow: 0 0 28px hsl(var(--down) / 0.55);
+  }
+
+  .glow-warn {
+    text-shadow: 0 0 24px hsl(var(--warn) / 0.5);
+  }
+
+  .glow-primary {
+    text-shadow: 0 0 24px hsl(var(--primary) / 0.5);
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+@keyframes blink-live {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.animate-blink {
+  animation: blink-live 1.4s ease-in-out infinite;
+}
+
+@keyframes danger-flash {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+.animate-danger {
+  animation: danger-flash 0.7s ease-in-out infinite;
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://rork.com/schema/rork.json",
+  "apps": [
+    {
+      "name": "Prediction Edge AI",
+      "path": "web",
+      "framework": "web"
+    },
+    {
+      "name": "iOS",
+      "path": "ios",
+      "framework": "swift"
+    }
+  ]
+}
